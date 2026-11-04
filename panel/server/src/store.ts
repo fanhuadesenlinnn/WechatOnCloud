@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import bcrypt from 'bcryptjs';
@@ -25,20 +25,58 @@ export interface User {
 // 初始默认管理员密码；管理员仍在用它时强烈提示改密。
 const DEFAULT_ADMIN_PASSWORD = 'wechat';
 
+// v1.2.0：实例可承载多种应用（不止微信）。同一镜像运行时按 appType 安装/启动对应应用。
+export type AppType = 'wechat' | 'telegram' | 'chromium' | 'qq' | 'custom';
+export const APP_TYPES: AppType[] = ['wechat', 'telegram', 'chromium', 'qq', 'custom'];
+export const APP_LABELS: Record<AppType, string> = {
+  wechat: '微信',
+  telegram: 'Telegram',
+  chromium: 'Chromium', // 与前端新建实例时的选项名一致（自动命名用）
+  qq: 'QQ',
+  custom: '自定义应用',
+};
+// 向后兼容：v1.2.0 之前创建的实例没有 appType 字段，一律视为微信。
+export function instanceAppType(i: Instance): AppType {
+  return i.appType && APP_TYPES.includes(i.appType) ? i.appType : 'wechat';
+}
+
 export interface Instance {
   id: string; // 短 id，用于容器/卷命名
   name: string; // 显示名
+  appType?: AppType; // 承载的应用类型；缺省（老实例）= wechat（见 instanceAppType）
+  icon?: string; // 自定义图标：data: 图片(base64) 或 builtin:<key>；缺省按 appType 取默认图标
   containerName: string; // woc-wx-<id>
   volumeName: string; // woc-data-<id>
   kasmUser: string; // 随机生成，服务端注入反代，永不下发前端
   kasmPassword: string;
   createdAt: string;
   createdBy: string; // userId
+  // 自定义应用（appType=custom）：用户上传的安装包信息，autostart 据此启动。
+  customLaunch?: string; // 启动命令（容器内绝对路径或命令）
+  // 自愈 watchdog 的"安全阀"，per-instance 覆盖全局默认；缺省时使用 env / 内置默认。
+  // soft：内存超此值时，仅在"当前没有用户在远程会话"才主动重启（柔和自愈）；
+  // hard：内存超此值时，无论是否有人在会话都重启（防止 OOM 拖垮宿主）。
+  memSoftLimitMB?: number;
+  memHardLimitMB?: number;
+  // 容器还没建成功时的原因（#129）：创建/重试创建失败时写入，建成后清除。有值时面板启动不再自动重试
+  // （重试多半又要拉镜像，会把面板开始监听拖上好几分钟），卡片显示「创建失败」等管理员点重试。
+  // 创建开始时先写一个「未完成」占位：面板在创建途中重启时，重启后能看出这次创建没完成，而不是一个无解释的「未创建」。
+  createError?: string; // 哪一步、为什么（人话）
+  createErrorHint?: string; // 怎么办
+  createErrorAt?: string;
+}
+
+// 面板级全局设置（持久化进 accounts.json）。
+export interface Settings {
+  // 实例桌面深色模式：由面板顶栏的主题开关统一控制（管理员）。true=实例内应用走深色。
+  // 既作为新建/重启实例的初始明暗（经容器环境 WOC_DARK 下发），也用于对运行中实例实时切换。
+  desktopDark?: boolean;
 }
 
 interface Data {
   users: User[];
   instances: Instance[];
+  settings?: Settings;
 }
 
 const FILE = process.env.PANEL_DATA || '/data/panel/accounts.json';
@@ -46,10 +84,11 @@ const FILE = process.env.PANEL_DATA || '/data/panel/accounts.json';
 let data: Data = { users: [], instances: [] };
 
 function persist() {
-  mkdirSync(dirname(FILE), { recursive: true });
+  mkdirSync(dirname(FILE), { recursive: true, mode: 0o700 });
   const tmp = `${FILE}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
   renameSync(tmp, FILE);
+  chmodSync(FILE, 0o600);
 }
 
 function makeUser(username: string, password: string, role: Role): User {
@@ -104,6 +143,20 @@ export function initStore() {
       console.log(`[store] 已重置用户 '${u.username}' 的密码（resetPassword 标记，密码=PANEL_ADMIN_PASSWORD 或默认 wechat）`);
     }
   }
+  persist();
+}
+
+// ---------- 全局设置 ----------
+export function getSettings(): Settings {
+  return data.settings || (data.settings = {});
+}
+
+export function getDesktopDark(): boolean {
+  return !!getSettings().desktopDark;
+}
+
+export function setDesktopDark(v: boolean) {
+  getSettings().desktopDark = !!v;
   persist();
 }
 
@@ -174,6 +227,18 @@ export function deleteUser(id: string) {
   persist();
 }
 
+// 改用户名（登录名）。格式校验在路由层；这里只查重并写入。会话以 userId 为准，改名后无需重新登录。
+export function renameUser(id: string, newUsername: string) {
+  const u = findById(id);
+  if (!u) throw new Error('用户不存在');
+  const name = String(newUsername || '').trim();
+  const existing = findByUsername(name);
+  if (existing && existing.id !== id) throw new Error('用户名已存在');
+  u.username = name;
+  persist();
+  return publicUser(u);
+}
+
 // 设置某账户可访问的实例（账户侧编辑）
 export function setUserInstances(id: string, instanceIds: string[]) {
   const u = findById(id);
@@ -190,7 +255,41 @@ function sanitizeInstanceIds(ids: string[]): string[] {
 }
 
 export function publicInstance(i: Instance) {
-  return { id: i.id, name: i.name, createdAt: i.createdAt, createdBy: i.createdBy };
+  return {
+    id: i.id,
+    name: i.name,
+    appType: instanceAppType(i), // 老实例无字段时回退 wechat
+    icon: i.icon,
+    createdAt: i.createdAt,
+    createdBy: i.createdBy,
+    memSoftLimitMB: i.memSoftLimitMB,
+    memHardLimitMB: i.memHardLimitMB,
+  };
+}
+
+// 设置/清除某实例的 mem 安全阀。传 null 表示恢复默认（从对象上删字段）。
+// 校验：正整数；soft < hard；上限 20480 MiB（20 GiB）。
+export function setInstanceMemLimits(
+  id: string,
+  softMB: number | null,
+  hardMB: number | null,
+) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  const norm = (v: number | null): number | undefined => {
+    if (v == null) return undefined;
+    if (!Number.isFinite(v) || !Number.isInteger(v) || v < 1 || v > 20480) {
+      throw new Error('阈值需为 1-20480 之间的整数（MiB）');
+    }
+    return v;
+  };
+  const s = norm(softMB);
+  const h = norm(hardMB);
+  if (s != null && h != null && s >= h) throw new Error('soft 阈值需小于 hard 阈值');
+  inst.memSoftLimitMB = s;
+  inst.memHardLimitMB = h;
+  persist();
+  return publicInstance(inst);
 }
 
 export function listInstances() {
@@ -213,13 +312,46 @@ export function userCanAccess(u: User, instanceId: string) {
   return u.allowedInstances.includes(instanceId) && !!findInstance(instanceId);
 }
 
-export function createInstance(name: string, createdBy: string, allowedUserIds: string[] = []) {
-  const id = randomBytes(5).toString('hex'); // 10 hex chars
+// 复用旧卷时：从 woc-data-<id> 解析回 id，让新实例的 containerName / volumeName 都对齐旧卷的
+// id（避免出现"卷叫 woc-data-abc，但实例 id 是 def"这种命名错配）。若旧 id 与现存实例冲突或卷名
+// 非标准前缀，则退回新生成 id，仅卷名指向旧卷。
+function parseIdFromVolume(volumeName: string): string | null {
+  const m = /^woc-data-([0-9a-f]{10})$/.exec(volumeName);
+  return m ? m[1] : null;
+}
+
+// 名称留空时自动命名：「微信 1」「微信 2」……取第一个没被占用的编号
+function autoInstanceName(type: AppType): string {
+  const used = new Set(data.instances.map((i) => i.name));
+  for (let n = 1; ; n++) {
+    const name = `${APP_LABELS[type]} ${n}`;
+    if (!used.has(name)) return name;
+  }
+}
+
+export function createInstance(
+  name: string,
+  createdBy: string,
+  allowedUserIds: string[] = [],
+  reuseVolumeName?: string,
+  appType: AppType = 'wechat',
+) {
+  const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
+  let id = randomBytes(5).toString('hex'); // 10 hex chars
+  let volumeName = `woc-data-${id}`;
+  if (reuseVolumeName) {
+    const reusedId = parseIdFromVolume(reuseVolumeName);
+    if (reusedId && !findInstance(reusedId)) {
+      id = reusedId;
+    }
+    volumeName = reuseVolumeName; // 始终指向旧卷（即便 id 是新生成的）
+  }
   const inst: Instance = {
     id,
-    name: name.trim() || `微信-${id.slice(0, 4)}`,
+    name: name.trim() || autoInstanceName(type),
+    appType: type,
     containerName: `woc-wx-${id}`,
-    volumeName: `woc-data-${id}`,
+    volumeName,
     kasmUser: 'woc',
     // 用 hex（仅 0-9a-f）：容器内 init 脚本以 `openssl passwd -apr1 ${PASSWORD}` 未加引号方式生成 .htpasswd，
     // base64url 可能含前导 '-' 而被 openssl 当作命令行选项，导致密码哈希为空、所有鉴权失败。hex 不含任何 shell 特殊字符。
@@ -247,6 +379,40 @@ export function renameInstance(id: string, name: string) {
   inst.name = n;
   persist();
   return publicInstance(inst);
+}
+
+// 设置/清除实例自定义图标。传空 → 恢复按 appType 的默认图标。
+// 仅允许 builtin:<key> 或 data:image/...（裁剪后约 128px，限 ~225KB，防滥用撑大 accounts.json）。
+export function setInstanceIcon(id: string, icon: string | null) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  const v = (icon ?? '').trim();
+  if (!v) {
+    delete inst.icon;
+  } else if (/^builtin:[a-z0-9_-]{1,32}$/.test(v) || (v.startsWith('data:image/') && v.length <= 300000)) {
+    inst.icon = v;
+  } else {
+    throw new Error('图标格式不合法或过大');
+  }
+  persist();
+  return publicInstance(inst);
+}
+
+// 记下 / 清除「容器没建成」的原因（见 Instance.createError）。实例已被删掉时静默忽略（后台创建与删除可能前后脚）。
+export function setInstanceCreateError(id: string, err: { summary: string; advice?: string } | null) {
+  const inst = findInstance(id);
+  if (!inst) return;
+  if (err) {
+    inst.createError = err.summary.slice(0, 500);
+    inst.createErrorHint = (err.advice || '').slice(0, 1000) || undefined;
+    inst.createErrorAt = new Date().toISOString();
+  } else {
+    if (inst.createError === undefined) return;
+    delete inst.createError;
+    delete inst.createErrorHint;
+    delete inst.createErrorAt;
+  }
+  persist();
 }
 
 export function removeInstance(id: string) {
